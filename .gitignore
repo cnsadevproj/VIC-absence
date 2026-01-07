@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+
+# Credentials (절대 커밋하지 말 것!)
+*.json
+!data/*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

@@ -1,0 +1,64 @@
+name: Attendance Check
+
+on:
+  # 수동 실행 (핸드폰에서 버튼 클릭)
+  workflow_dispatch:
+    inputs:
+      time_slot:
+        description: '시간대 선택'
+        required: true
+        default: 'morning'
+        type: choice
+        options:
+          - morning
+          - afternoon
+
+  # 자동 실행 스케줄 (선택사항 - 주석 해제하면 활성화)
+  # schedule:
+  #   - cron: '30 3 * * 1-5'   # 한국시간 12:30 (평일만)
+  #   - cron: '30 7 * * 1-5'   # 한국시간 16:30 (평일만)
+
+jobs:
+  check-attendance:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      - name: Determine time slot
+        id: time_slot
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "slot=${{ github.event.inputs.time_slot }}" >> $GITHUB_OUTPUT
+          else
+            # 스케줄 실행 시 현재 시간으로 판단 (UTC 기준)
+            HOUR=$(date -u +%H)
+            if [ $HOUR -lt 5 ]; then
+              echo "slot=morning" >> $GITHUB_OUTPUT
+            else
+              echo "slot=afternoon" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Run attendance check
+        env:
+          RIRO_USER_ID: ${{ secrets.RIRO_USER_ID }}
+          RIRO_PASSWORD: ${{ secrets.RIRO_PASSWORD }}
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          TIME_SLOT: ${{ steps.time_slot.outputs.slot }}
+        run: |
+          cd src
+          python main.py --time-slot $TIME_SLOT
