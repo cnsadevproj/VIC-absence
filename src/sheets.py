@@ -102,7 +102,7 @@ def update_notification_message(
     time_slot: str,
     target_date: str = None
 ):
-    """알림 문구 시트의 B3 셀에 메시지 작성
+    """알림 문구 시트의 B4 셀에 메시지 작성 (B3은 템플릿)
 
     Args:
         spreadsheet: gspread 스프레드시트 객체
@@ -132,8 +132,8 @@ def update_notification_message(
 
         # "알림 문구" 시트 찾기
         notify_sheet = spreadsheet.worksheet("알림 문구")
-        # B3 셀에 메시지 작성
-        notify_sheet.update("B3", message, value_input_option="RAW")
+        # B4 셀에 메시지 작성 (B3은 템플릿으로 유지)
+        notify_sheet.update(range_name="B4", values=[[message]], value_input_option="RAW")
         print(f"알림 문구 업데이트 완료 ({time_label}, {student_count}명)")
 
     except Exception as e:
@@ -257,12 +257,19 @@ def write_absence_records(
         # 특정 행부터 작성
         end_row = start_row + len(rows_to_write) - 1
         range_str = f"A{start_row}:J{end_row}"
-        worksheet.update(range_str, rows_to_write, value_input_option="USER_ENTERED")
+        worksheet.update(range_name=range_str, values=rows_to_write, value_input_option="USER_ENTERED")
         print(f"{start_row}행부터 {len(rows_to_write)}개의 행이 작성되었습니다.")
     else:
-        # 자동 추가
-        worksheet.append_rows(rows_to_write, value_input_option="USER_ENTERED")
-        print(f"{len(rows_to_write)}개의 행이 추가되었습니다.")
+        # 마지막 데이터 행 찾기 (A열 기준)
+        all_values = worksheet.col_values(1)  # A열 전체
+        last_row = len(all_values)
+
+        # 마지막 행 다음에 추가
+        next_row = last_row + 1
+        end_row = next_row + len(rows_to_write) - 1
+        range_str = f"A{next_row}:J{end_row}"
+        worksheet.update(range_name=range_str, values=rows_to_write, value_input_option="USER_ENTERED")
+        print(f"{next_row}행부터 {len(rows_to_write)}개의 행이 추가되었습니다.")
 
     # 알림 문구 업데이트 (time_slot이 지정된 경우)
     if time_slot:
