@@ -17,12 +17,12 @@ class AbsenceRecord:
 
 def login(page: Page, user_id: str, password: str) -> bool:
     """리로스쿨 로그인"""
-    page.goto("https://cnsa.riroschool.kr")
+    page.goto("https://cnsa.riroschool.kr/user.php?action=signin")
 
     # 로그인 폼 입력
-    page.fill('input[name="id"]', user_id)
-    page.fill('input[name="pw"]', password)
-    page.click('button[type="submit"], input[type="submit"], .btn_login, #login_btn')
+    page.fill('input#id', user_id)
+    page.fill('input#pw', password)
+    page.click('button.button_normal')
 
     # 로그인 성공 확인 (페이지 이동 대기)
     page.wait_for_load_state("networkidle")
@@ -82,12 +82,13 @@ def parse_students(student_text: str) -> list[tuple[str, str]]:
     return students
 
 
-def scrape_absence_data(page: Page, time_slot: str = "morning") -> list[AbsenceRecord]:
+def scrape_absence_data(page: Page, time_slot: str = "morning", target_date: str = None) -> list[AbsenceRecord]:
     """결석 데이터 스크래핑
 
     Args:
         page: Playwright 페이지 객체
         time_slot: "morning" (1-4교시) 또는 "afternoon" (5-8교시)
+        target_date: 조회할 날짜 (YYYY-MM-DD 형식), None이면 오늘
 
     Returns:
         AbsenceRecord 리스트
@@ -96,11 +97,27 @@ def scrape_absence_data(page: Page, time_slot: str = "morning") -> list[AbsenceR
     page.goto("https://cnsa.riroschool.kr/lecture.php?db=1703&cate=34&action=stat")
     page.wait_for_load_state("networkidle")
 
-    # 결석 라디오 버튼 클릭 (이미 선택되어 있을 수 있음)
+    # 날짜 선택 (target_date가 지정된 경우)
+    if target_date:
+        # sdate, edate 필드에 JavaScript로 값 설정 (readonly 속성 때문)
+        page.evaluate(f"""
+            document.querySelector('input[name="sdate"]').value = '{target_date}';
+            document.querySelector('input[name="edate"]').value = '{target_date}';
+        """)
+        # 조회 버튼 클릭
+        search_btn = page.locator('button:has-text("조회"), input[type="submit"], .btn_search, button:has-text("검색"), input[value="조회"]').first
+        if search_btn.count() > 0:
+            search_btn.click()
+            page.wait_for_load_state("networkidle")
+
+    # 결석 라디오 버튼 선택 (이미 checked면 건너뜀)
     abs_radio = page.locator('input[value="abs"]')
     if abs_radio.count() > 0:
-        abs_radio.first.click()
-        page.wait_for_load_state("networkidle")
+        is_checked = abs_radio.first.is_checked()
+        if not is_checked:
+            # JavaScript로 클릭 (숨겨진 요소일 수 있음)
+            page.evaluate('document.querySelector(\'input[value="abs"]\').click()')
+            page.wait_for_load_state("networkidle")
 
     # 테이블에서 데이터 추출
     rows = page.locator('table tbody tr').all()
@@ -172,8 +189,15 @@ def scrape_absence_data(page: Page, time_slot: str = "morning") -> list[AbsenceR
     return records
 
 
-def run_scraper(user_id: str, password: str, time_slot: str = "morning") -> list[AbsenceRecord]:
-    """스크래퍼 실행 메인 함수"""
+def run_scraper(user_id: str, password: str, time_slot: str = "morning", target_date: str = None) -> list[AbsenceRecord]:
+    """스크래퍼 실행 메인 함수
+
+    Args:
+        user_id: 리로스쿨 아이디
+        password: 리로스쿨 비밀번호
+        time_slot: "morning" (1-4교시) 또는 "afternoon" (5-8교시)
+        target_date: 조회할 날짜 (YYYY-MM-DD 형식), None이면 오늘
+    """
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         context = browser.new_context()
@@ -185,7 +209,7 @@ def run_scraper(user_id: str, password: str, time_slot: str = "morning") -> list
                 raise Exception("로그인 실패")
 
             # 데이터 스크래핑
-            records = scrape_absence_data(page, time_slot)
+            records = scrape_absence_data(page, time_slot, target_date)
 
             return records
         finally:

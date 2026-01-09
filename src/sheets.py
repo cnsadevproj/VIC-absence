@@ -76,6 +76,70 @@ def get_next_row_number(worksheet, today_date: str) -> int:
     return max_num + 1
 
 
+def get_cancelled_students(spreadsheet) -> set[str]:
+    """취소자 명단 시트에서 학번 목록 가져오기
+
+    Returns:
+        취소자 학번 set
+    """
+    try:
+        # "취소자 명단" 시트 찾기
+        cancel_sheet = spreadsheet.worksheet("취소자 명단")
+        # A열에서 2행부터 학번 가져오기
+        student_ids = cancel_sheet.col_values(1)[1:]  # 헤더 제외
+        return set(sid for sid in student_ids if sid.strip())
+    except Exception as e:
+        print(f"취소자 명단 시트 조회 실패: {e}")
+        return set()
+
+
+WEEKDAYS = ["월", "화", "수", "목", "금", "토", "일"]
+
+
+def update_notification_message(
+    spreadsheet,
+    student_count: int,
+    time_slot: str,
+    target_date: str = None
+):
+    """알림 문구 시트의 B3 셀에 메시지 작성
+
+    Args:
+        spreadsheet: gspread 스프레드시트 객체
+        student_count: 결석 학생 수
+        time_slot: "morning" 또는 "afternoon"
+        target_date: 날짜 (YYYY-MM-DD), None이면 오늘
+    """
+    try:
+        # 날짜 파싱
+        if target_date:
+            date_obj = datetime.strptime(target_date, "%Y-%m-%d")
+        else:
+            date_obj = datetime.now()
+
+        month = date_obj.month
+        day = date_obj.day
+        weekday = WEEKDAYS[date_obj.weekday()]
+        time_label = "오전" if time_slot == "morning" else "오후"
+
+        # 메시지 작성
+        message = f"""안녕하세요, 이현경 부장님.
+{month}월 {day}일({weekday}) 겨울방학 방과후 출결결과 보내드립니다.
+
+총 {student_count}명의 학생 및 학부모님께 {time_label} 알림 발송 완료했습니다.
+
+[VIC 강의 출결 현황 스프레드시트] https://docs.google.com/spreadsheets/d/1Gi2Qu_5nTba-pHfdRy6S_iyxXnhEiogxoxNFz7n37DY/edit?usp=sharing"""
+
+        # "알림 문구" 시트 찾기
+        notify_sheet = spreadsheet.worksheet("알림 문구")
+        # B3 셀에 메시지 작성
+        notify_sheet.update("B3", message, value_input_option="RAW")
+        print(f"알림 문구 업데이트 완료 ({time_label}, {student_count}명)")
+
+    except Exception as e:
+        print(f"알림 문구 업데이트 실패: {e}")
+
+
 def format_periods(periods: list[int]) -> str:
     """교시 리스트를 문자열로 변환
 
@@ -90,7 +154,10 @@ def format_periods(periods: list[int]) -> str:
 def write_absence_records(
     credentials_json: str | dict,
     records: list[AbsenceRecord],
-    spreadsheet_id: str = SPREADSHEET_ID
+    spreadsheet_id: str = SPREADSHEET_ID,
+    target_date: str = None,
+    start_row: int = None,
+    time_slot: str = None
 ) -> int:
     """결석 기록을 스프레드시트에 작성
 
@@ -98,6 +165,9 @@ def write_absence_records(
         credentials_json: 서비스 계정 JSON
         records: 결석 기록 리스트
         spreadsheet_id: 스프레드시트 ID
+        target_date: 기록할 날짜 (YYYY-MM-DD), None이면 오늘
+        start_row: 시작 행 번호, None이면 자동 추가
+        time_slot: "morning" 또는 "afternoon" (알림 문구용)
 
     Returns:
         작성된 행 수
@@ -116,15 +186,31 @@ def write_absence_records(
     except Exception:
         worksheet = spreadsheet.sheet1
 
+    # 취소자 명단 가져오기
+    cancelled_students = get_cancelled_students(spreadsheet)
+    if cancelled_students:
+        print(f"취소자 {len(cancelled_students)}명 제외")
+
+    # 취소자 필터링
+    filtered_records = [r for r in records if r.student_id not in cancelled_students]
+
+    if len(filtered_records) < len(records):
+        excluded = len(records) - len(filtered_records)
+        print(f"  (취소자로 인해 {excluded}명 제외됨)")
+
+    if not filtered_records:
+        print("취소자 제외 후 작성할 결석 기록이 없습니다.")
+        return 0
+
     # 학생 명렬 데이터 로드
     grade1_data, grade2_data = load_student_data()
 
-    # 오늘 날짜
-    today = datetime.now().strftime("%Y-%m-%d")
+    # 날짜 설정
+    date_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
 
     # 1학년, 2학년 분리
-    grade1_records = [r for r in records if r.grade == 1]
-    grade2_records = [r for r in records if r.grade == 2]
+    grade1_records = [r for r in filtered_records if r.grade == 1]
+    grade2_records = [r for r in filtered_records if r.grade == 2]
 
     # 더 많은 쪽 기준으로 행 수 결정
     max_rows = max(len(grade1_records), len(grade2_records))
@@ -134,16 +220,16 @@ def write_absence_records(
         return 0
 
     # 다음 순번 가져오기
-    next_num = get_next_row_number(worksheet, today)
+    next_num = get_next_row_number(worksheet, date_str)
 
     # 작성할 데이터 준비
-    rows_to_append = []
+    rows_to_write = []
 
     for i in range(max_rows):
         row = [""] * 10  # A~J 열
 
         # A열: 날짜, B열: 순번
-        row[0] = today
+        row[0] = date_str
         row[1] = next_num + i
 
         # 1학년 데이터 (C~F)
@@ -164,13 +250,27 @@ def write_absence_records(
             row[8] = student_info.get("type", "")  # I: 기숙/통학
             row[9] = format_periods(r.periods)  # J: 교시
 
-        rows_to_append.append(row)
+        rows_to_write.append(row)
 
-    # 데이터 추가
-    worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+    # 데이터 작성
+    if start_row:
+        # 특정 행부터 작성
+        end_row = start_row + len(rows_to_write) - 1
+        range_str = f"A{start_row}:J{end_row}"
+        worksheet.update(range_str, rows_to_write, value_input_option="USER_ENTERED")
+        print(f"{start_row}행부터 {len(rows_to_write)}개의 행이 작성되었습니다.")
+    else:
+        # 자동 추가
+        worksheet.append_rows(rows_to_write, value_input_option="USER_ENTERED")
+        print(f"{len(rows_to_write)}개의 행이 추가되었습니다.")
 
-    print(f"{len(rows_to_append)}개의 행이 추가되었습니다.")
-    return len(rows_to_append)
+    # 알림 문구 업데이트 (time_slot이 지정된 경우)
+    if time_slot:
+        # 실제 결석 학생 수 (1학년 + 2학년)
+        total_students = len(grade1_records) + len(grade2_records)
+        update_notification_message(spreadsheet, total_students, time_slot, date_str)
+
+    return len(rows_to_write)
 
 
 if __name__ == "__main__":
