@@ -2,6 +2,7 @@
 Google Sheets 연동 모듈
 """
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -57,23 +58,85 @@ def get_client(credentials_json: str | dict) -> gspread.Client:
     return gspread.authorize(creds)
 
 
-def get_next_row_number(worksheet, today_date: str) -> int:
-    """오늘 날짜의 다음 순번 계산
+def get_today_existing_data(worksheet, today_date: str) -> dict:
+    """오늘 날짜의 기존 데이터 조회
 
-    A열에서 오늘 날짜가 있는 행들 중 B열의 최대값 + 1 반환
+    Returns:
+        {
+            'grade1': {학번: {'row': 행번호, 'periods': "1,2교시"}},
+            'grade2': {학번: {'row': 행번호, 'periods': "5,6교시"}},
+            'max_seq': 최대 순번,
+            'last_row': 마지막 데이터 행 번호
+        }
     """
     all_values = worksheet.get_all_values()
 
-    max_num = 0
-    for row in all_values[1:]:  # 헤더 제외
+    result = {
+        'grade1': {},  # C열 학번 -> 행 정보
+        'grade2': {},  # G열 학번 -> 행 정보
+        'max_seq': 0,
+        'last_row': 1  # 헤더 기본값
+    }
+
+    for idx, row in enumerate(all_values):
+        row_num = idx + 1  # 1-based row number
+
+        # 헤더 제외 (첫 행)
+        if idx == 0:
+            continue
+
+        # 데이터가 있는 행 추적
+        if len(row) >= 1 and row[0]:
+            result['last_row'] = row_num
+
+        # 오늘 날짜 데이터만 처리
         if len(row) >= 2 and row[0] == today_date:
+            # 순번 최대값 추적
             try:
-                num = int(row[1])
-                max_num = max(max_num, num)
+                seq = int(row[1])
+                result['max_seq'] = max(result['max_seq'], seq)
             except ValueError:
                 pass
 
-    return max_num + 1
+            # 1학년 데이터 (C열=학번, F열=교시)
+            if len(row) >= 6 and row[2]:
+                student_id = row[2]
+                periods = row[5] if len(row) > 5 else ""
+                result['grade1'][student_id] = {
+                    'row': row_num,
+                    'periods': periods
+                }
+
+            # 2학년 데이터 (G열=학번, J열=교시)
+            if len(row) >= 10 and row[6]:
+                student_id = row[6]
+                periods = row[9] if len(row) > 9 else ""
+                result['grade2'][student_id] = {
+                    'row': row_num,
+                    'periods': periods
+                }
+
+    return result
+
+
+def merge_periods(existing_periods: str, new_periods: list[int]) -> str:
+    """기존 교시와 새 교시 병합
+
+    예: "1,2교시" + [5, 6] -> "1,2,5,6교시"
+    """
+    # 기존 교시 파싱
+    existing = set()
+    if existing_periods:
+        # "1,2교시" -> [1, 2]
+        nums = re.findall(r'\d+', existing_periods.split('교시')[0])
+        existing = set(int(n) for n in nums)
+
+    # 새 교시 추가
+    existing.update(new_periods)
+
+    # 정렬 후 문자열로
+    sorted_periods = sorted(existing)
+    return ",".join(str(p) for p in sorted_periods) + "교시"
 
 
 def get_cancelled_students(spreadsheet) -> set[str]:
@@ -161,12 +224,16 @@ def write_absence_records(
 ) -> int:
     """결석 기록을 스프레드시트에 작성
 
+    - 오늘 날짜에 이미 있는 학생은 교시만 병합 (중복 행 방지)
+    - 새 학생만 마지막 행 아래에 추가
+    - 순번은 당일 기준 1부터 시작
+
     Args:
         credentials_json: 서비스 계정 JSON
         records: 결석 기록 리스트
         spreadsheet_id: 스프레드시트 ID
         target_date: 기록할 날짜 (YYYY-MM-DD), None이면 오늘
-        start_row: 시작 행 번호, None이면 자동 추가
+        start_row: 시작 행 번호, None이면 자동 추가 (deprecated)
         time_slot: "morning" 또는 "afternoon" (알림 문구용)
 
     Returns:
@@ -208,76 +275,105 @@ def write_absence_records(
     # 날짜 설정
     date_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
 
+    # 오늘 날짜의 기존 데이터 조회
+    existing_data = get_today_existing_data(worksheet, date_str)
+    print(f"기존 데이터: 1학년 {len(existing_data['grade1'])}명, 2학년 {len(existing_data['grade2'])}명")
+
     # 1학년, 2학년 분리
     grade1_records = [r for r in filtered_records if r.grade == 1]
     grade2_records = [r for r in filtered_records if r.grade == 2]
 
-    # 더 많은 쪽 기준으로 행 수 결정
-    max_rows = max(len(grade1_records), len(grade2_records))
+    # 중복 학생 분리 (기존에 있으면 업데이트, 없으면 신규)
+    grade1_update = []  # 기존 학생 - 교시 업데이트
+    grade1_new = []     # 신규 학생
+    grade2_update = []
+    grade2_new = []
 
-    if max_rows == 0:
-        print("작성할 결석 기록이 없습니다.")
-        return 0
+    for r in grade1_records:
+        if r.student_id in existing_data['grade1']:
+            grade1_update.append(r)
+        else:
+            grade1_new.append(r)
 
-    # 다음 순번 가져오기
-    next_num = get_next_row_number(worksheet, date_str)
+    for r in grade2_records:
+        if r.student_id in existing_data['grade2']:
+            grade2_update.append(r)
+        else:
+            grade2_new.append(r)
 
-    # 작성할 데이터 준비
-    rows_to_write = []
+    updated_count = 0
+    new_rows_count = 0
 
-    for i in range(max_rows):
-        row = [""] * 10  # A~J 열
+    # 1. 기존 학생 교시 업데이트 (개별 셀 업데이트)
+    for r in grade1_update:
+        existing = existing_data['grade1'][r.student_id]
+        merged = merge_periods(existing['periods'], r.periods)
+        cell = f"F{existing['row']}"  # F열 = 1학년 교시
+        worksheet.update(range_name=cell, values=[[merged]], value_input_option="USER_ENTERED")
+        print(f"  1학년 {r.name} 교시 업데이트: {existing['periods']} -> {merged}")
+        updated_count += 1
 
-        # A열: 날짜, B열: 순번
-        row[0] = date_str
-        row[1] = next_num + i
+    for r in grade2_update:
+        existing = existing_data['grade2'][r.student_id]
+        merged = merge_periods(existing['periods'], r.periods)
+        cell = f"J{existing['row']}"  # J열 = 2학년 교시
+        worksheet.update(range_name=cell, values=[[merged]], value_input_option="USER_ENTERED")
+        print(f"  2학년 {r.name} 교시 업데이트: {existing['periods']} -> {merged}")
+        updated_count += 1
 
-        # 1학년 데이터 (C~F)
-        if i < len(grade1_records):
-            r = grade1_records[i]
-            student_info = grade1_data.get(r.student_id, {})
-            row[2] = r.student_id  # C: 학번
-            row[3] = r.name  # D: 이름
-            row[4] = student_info.get("type", "")  # E: 기숙/통학
-            row[5] = format_periods(r.periods)  # F: 교시
+    # 2. 신규 학생 추가 (새 행)
+    max_new_rows = max(len(grade1_new), len(grade2_new))
 
-        # 2학년 데이터 (G~J)
-        if i < len(grade2_records):
-            r = grade2_records[i]
-            student_info = grade2_data.get(r.student_id, {})
-            row[6] = r.student_id  # G: 학번
-            row[7] = r.name  # H: 이름
-            row[8] = student_info.get("type", "")  # I: 기숙/통학
-            row[9] = format_periods(r.periods)  # J: 교시
-
-        rows_to_write.append(row)
-
-    # 데이터 작성
-    if start_row:
-        # 특정 행부터 작성
-        end_row = start_row + len(rows_to_write) - 1
-        range_str = f"A{start_row}:J{end_row}"
-        worksheet.update(range_name=range_str, values=rows_to_write, value_input_option="USER_ENTERED")
-        print(f"{start_row}행부터 {len(rows_to_write)}개의 행이 작성되었습니다.")
-    else:
-        # 마지막 데이터 행 찾기 (A열 기준)
-        all_values = worksheet.col_values(1)  # A열 전체
-        last_row = len(all_values)
+    if max_new_rows > 0:
+        # 다음 순번 (당일 기준)
+        next_seq = existing_data['max_seq'] + 1
 
         # 마지막 행 다음에 추가
-        next_row = last_row + 1
+        next_row = existing_data['last_row'] + 1
+
+        rows_to_write = []
+        for i in range(max_new_rows):
+            row = [""] * 10  # A~J 열
+
+            # A열: 날짜, B열: 순번
+            row[0] = date_str
+            row[1] = next_seq + i
+
+            # 1학년 데이터 (C~F)
+            if i < len(grade1_new):
+                r = grade1_new[i]
+                student_info = grade1_data.get(r.student_id, {})
+                row[2] = r.student_id  # C: 학번
+                row[3] = r.name  # D: 이름
+                row[4] = student_info.get("type", "")  # E: 기숙/통학
+                row[5] = format_periods(r.periods)  # F: 교시
+
+            # 2학년 데이터 (G~J)
+            if i < len(grade2_new):
+                r = grade2_new[i]
+                student_info = grade2_data.get(r.student_id, {})
+                row[6] = r.student_id  # G: 학번
+                row[7] = r.name  # H: 이름
+                row[8] = student_info.get("type", "")  # I: 기숙/통학
+                row[9] = format_periods(r.periods)  # J: 교시
+
+            rows_to_write.append(row)
+
+        # 데이터 작성
         end_row = next_row + len(rows_to_write) - 1
         range_str = f"A{next_row}:J{end_row}"
         worksheet.update(range_name=range_str, values=rows_to_write, value_input_option="USER_ENTERED")
-        print(f"{next_row}행부터 {len(rows_to_write)}개의 행이 추가되었습니다.")
+        print(f"{next_row}행부터 {len(rows_to_write)}개의 신규 행 추가됨")
+        new_rows_count = len(rows_to_write)
 
     # 알림 문구 업데이트 (time_slot이 지정된 경우)
     if time_slot:
-        # 실제 결석 학생 수 (1학년 + 2학년)
+        # 실제 결석 학생 수 (기존 + 신규 모두 포함)
         total_students = len(grade1_records) + len(grade2_records)
         update_notification_message(spreadsheet, total_students, time_slot, date_str)
 
-    return len(rows_to_write)
+    print(f"완료: 업데이트 {updated_count}명, 신규 추가 {new_rows_count}행")
+    return new_rows_count
 
 
 if __name__ == "__main__":

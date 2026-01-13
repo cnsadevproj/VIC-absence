@@ -94,7 +94,7 @@ def main():
     else:
         print("스프레드시트에 기록 중...")
         try:
-            rows_written = write_absence_records(credentials, records)
+            rows_written = write_absence_records(credentials, records, time_slot=args.time_slot)
             print(f"완료! {rows_written}개 행 추가됨")
         except Exception as e:
             print(f"스프레드시트 기록 오류: {e}")
